@@ -1,19 +1,18 @@
-wait(5)
-
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local osClock = os.clock
 
--- 配置项（仿照原脚本 Config）
+-- 配置项
 local Config = {
     LoadTimeout = 10,
     RequireTimeout = 5,
+    RequestDelay = 0.2, -- 每次请求之间的间隔（秒），如果依然提示 was not received 可适当调大（如 0.5）
 }
 
--- 模块加载器（提取自原脚本 GameLib）
+-- 模块加载器（保持原脚本的安全加载机制）
 local GameLib = { Missing = {} }
 
---- 降级线程权限为 2（普通游戏脚本身份）后尝试 require，防止游戏模块检测执行器环境
+--- 降级线程权限为 2（普通游戏脚本身份）后尝试 require
 function GameLib.RequireAsGame(module)
     local finished, ok, loaded = false, false, nil
     task.spawn(function()
@@ -46,7 +45,7 @@ function GameLib.Require(module)
     return nil
 end
 
---- 安全查找节点：优先在指定父节点下查找，找不到则搜索整个 ReplicatedStorage
+--- 安全查找节点
 function GameLib.Find(root, name, class)
     local found = root and root:FindFirstChild(name, true)
     if not (found and found:IsA(class)) then
@@ -60,57 +59,75 @@ function GameLib.Find(root, name, class)
 end
 
 -- ==========================================
--- 核心逻辑：加载 PetAssetResolver 并遍历 CachedPets
+-- 核心逻辑：加载 Configs.Pets 并遍历 Key 调用 GetTemplate
 -- ==========================================
 
 local PetScanner = {
     Resolver = nil,
-    Templates = {}, -- 缓存获取到的结果: { [petName] = template }
+    PetsConfig = nil,
+    Templates = {}, -- 缓存获取到的模型: { [petName] = Model }
 }
 
 function PetScanner.Init()
     local timeout = Config.LoadTimeout
     
-    -- 1. 定位并加载 ReplicatedStorage.SharedUtilities.PetAssetResolver
+    -- 1. 加载 ReplicatedStorage.SharedUtilities.PetAssetResolver
     local sharedUtils = ReplicatedStorage:WaitForChild("SharedUtilities", timeout)
     local resolverModule = (sharedUtils and sharedUtils:WaitForChild("PetAssetResolver", timeout))
         or GameLib.Find(sharedUtils, "PetAssetResolver", "ModuleScript")
         
     PetScanner.Resolver = GameLib.Require(resolverModule)
-    if not PetScanner.Resolver then
+    if type(PetScanner.Resolver) ~= "table" then
         warn("[PetScanner] 无法加载 PetAssetResolver，脚本终止。")
         return false
     end
 
-    -- 2. 定位 ReplicatedStorage.CachedPets
-    local cachedPets = ReplicatedStorage:WaitForChild("CachedPets", timeout)
-        or ReplicatedStorage:FindFirstChild("CachedPets", true)
-    if not cachedPets then
-        warn("[PetScanner] 找不到 ReplicatedStorage.CachedPets 文件夹。")
+    -- 2. 加载 ReplicatedStorage.Configs.Pets
+    local configsFolder = ReplicatedStorage:WaitForChild("Configs", timeout)
+    local petsModule = (configsFolder and configsFolder:WaitForChild("Pets", timeout))
+        or GameLib.Find(configsFolder, "Pets", "ModuleScript")
+        
+    PetScanner.PetsConfig = GameLib.Require(petsModule)
+    if type(PetScanner.PetsConfig) ~= "table" then
+        warn("[PetScanner] 无法加载 ReplicatedStorage.Configs.Pets，脚本终止。")
         return false
     end
 
-    -- 3. 遍历所有子节点并调用 GetTemplate(child.Name)
-    local count = 0
-    for _, child in ipairs(cachedPets:GetChildren()) do
-        local petName = child.Name
-        
-        -- 注意：如果游戏内该函数是用冒号定义的 (function PetAssetResolver:GetTemplate(name))，
-        -- 请将下方 pcall 参数改为: pcall(PetScanner.Resolver.GetTemplate, PetScanner.Resolver, petName)
-        local ok, template = pcall(function()
-            return PetScanner.Resolver.GetTemplate(petName)
-        end)
+    -- 3. 收集并排序所有 Key（方便按字母顺序查看日志）
+    local petNames = {}
+    for petName, petData in pairs(PetScanner.PetsConfig) do
+        if type(petName) == "string" then
+            table.insert(petNames, petName)
+        end
+    end
+    table.sort(petNames)
+
+    print(string.format("[PetScanner] 从 Configs.Pets 中读取到 %d 个宠物配置，开始获取模板...", #petNames))
+
+    -- 4. 遍历所有 Key 并调用 PetAssetResolver.GetTemplate(petName)
+    local successCount = 0
+    for index, petName in ipairs(petNames) do
+        -- 先检查本地 PetAssets 是否已经缓存过，若已缓存则无需等待冷却
+        local cached = PetScanner.Resolver.GetCachedTemplate(petName)
+        local ok, template = true, cached
+
+        if not cached then
+            ok, template = pcall(PetScanner.Resolver.GetTemplate, petName)
+            if Config.RequestDelay > 0 then
+                task.wait(Config.RequestDelay)
+            end
+        end
 
         if ok and template ~= nil then
             PetScanner.Templates[petName] = template
-            count = count + 1
-            print(string.format("[PetScanner] 成功获取模板: %-20s -> %s", petName, tostring(template)))
+            successCount = successCount + 1
+            print(string.format("[%d/%d] 成功获取模板: %-25s -> %s", index, #petNames, petName, template:GetFullName()))
         else
-            warn(string.format("[PetScanner] 获取模板失败 (%s): %s", petName, tostring(template)))
+            warn(string.format("[%d/%d] 获取模板失败: %-25s (原因: %s)", index, #petNames, petName, tostring(template)))
         end
     end
 
-    print(string.format("[PetScanner] 扫描完成，共解析 %d / %d 个宠物模板。", count, #cachedPets:GetChildren()))
+    print(string.format("[PetScanner] 全部遍历完成！成功获取 %d / %d 个宠物模型（已存入 ReplicatedStorage.PetAssets）。", successCount, #petNames))
     return true
 end
 
