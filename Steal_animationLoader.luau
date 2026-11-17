@@ -92,7 +92,7 @@ local function loadAnimalAnimations(configModule)
 end
 
 for _, configModule in ipairs(configs:GetDescendants()) do
-    if configModule:IsA("ModuleScript") and configModule.Name == "Basilisk" then
+    if configModule:IsA("ModuleScript") then
         loadAnimalAnimations(configModule)
     end
 end
